@@ -15,8 +15,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Start the application using Railway's PORT variable
-<<<<<<< HEAD
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
-=======
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
->>>>>>> 5247b9c67bb5ca657bb1ac145b001a9014982b7e
