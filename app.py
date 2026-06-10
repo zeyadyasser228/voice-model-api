@@ -31,7 +31,7 @@ classifier = EncoderClassifier.from_hparams(
 
 # ── Constants ────────────────────────────────────────────────────────────────
 EMBEDDING_DIM       = 192    # ECAPA-TDNN output size (Table 5.6)
-SIMILARITY_THRESHOLD = 0.75  # Cosine similarity threshold (Table 5.9)
+SIMILARITY_THRESHOLD = 0.30  # Cosine similarity threshold
 MIN_AUDIO_SECONDS   = 2.5    # Minimum speech duration (Section 5.13)
 SAMPLE_RATE         = 16000  # Required sample rate for ECAPA-TDNN
 
@@ -44,25 +44,76 @@ faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
 
 # ── Helper Functions ─────────────────────────────────────────────────────────
 
+def trim_silence(waveform: torch.Tensor, sr: int = 16000, frame_length_ms: int = 25, hop_length_ms: int = 10, threshold_db: float = -35.0) -> torch.Tensor:
+    """
+    Trim silence from the beginning and end of the audio waveform.
+    Uses windowed energy threshold in decibels.
+    """
+    if waveform.shape[1] == 0:
+        return waveform
+
+    frame_length = int(sr * frame_length_ms / 1000)
+    hop_length = int(sr * hop_length_ms / 1000)
+
+    if waveform.shape[1] < frame_length:
+        return waveform
+
+    # Fold waveform into overlapping frames along time dimension
+    frames = waveform.unfold(1, frame_length, hop_length) # shape: [1, num_frames, frame_length]
+    
+    # Calculate average energy per frame
+    energy = frames.pow(2).mean(dim=2).squeeze(0) # shape: [num_frames]
+    
+    # Avoid log of zero
+    energy_db = 10 * torch.log10(energy + 1e-10)
+
+    # Find speech frames
+    speech_indices = (energy_db > threshold_db).nonzero(as_tuple=True)[0]
+
+    if len(speech_indices) == 0:
+        return waveform  # Fall back to original if no speech is detected
+
+    start_frame = speech_indices[0].item()
+    end_frame = speech_indices[-1].item()
+
+    start_sample = start_frame * hop_length
+    end_sample = min(end_frame * hop_length + frame_length, waveform.shape[1])
+
+    return waveform[:, start_sample:end_sample]
+
+
 def load_and_validate_audio(audio_path: str):
     """
-    Load audio and enforce minimum 2.5s duration (Validation Rule 2, Section 5.13).
+    Load audio, apply peak normalization & silence trimming, and enforce minimum duration.
     Returns (waveform_tensor, sample_rate) or raises ValueError.
     """
     waveform, sr = torchaudio.load(audio_path)
 
+    # Remove DC Offset
+    waveform = waveform - waveform.mean()
+
+    # Peak normalization to scale volume to [-1.0, 1.0] range
+    max_val = waveform.abs().max()
+    if max_val > 0:
+        waveform = waveform / max_val
+
+    # Convert to mono if multi-channel
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
+    # Resample to 16kHz
     if sr != SAMPLE_RATE:
         resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
         waveform = resampler(waveform)
         sr = SAMPLE_RATE
 
+    # Trim silence from starts/ends
+    waveform = trim_silence(waveform, sr)
+
     duration = waveform.shape[1] / sr
     if duration < MIN_AUDIO_SECONDS:
         raise ValueError(
-            f'Audio too short: {duration:.1f}s (minimum: {MIN_AUDIO_SECONDS}s). '
+            f'Audio too short (after trimming silence): {duration:.1f}s (minimum: {MIN_AUDIO_SECONDS}s). '
             f'ECAPA-TDNN requires sufficient phonetic diversity.'
         )
 
@@ -118,7 +169,7 @@ def enroll_speaker(audio_path: str, name: str, relation: str, patient_id: str) -
     }
 
 
-def identify_speaker(audio_path: str, patient_id: str) -> dict:
+def identify_speaker(audio_path: str, patient_id: str, threshold: float = SIMILARITY_THRESHOLD) -> dict:
     """
     Identify a speaker via FAISS cosine similarity search (Section 5.9 Stage 4).
     Applies Validation Rules 1–3 (Section 5.13).
@@ -154,7 +205,7 @@ def identify_speaker(audio_path: str, patient_id: str) -> dict:
                 best_score = score
                 best_speaker = speaker
 
-    if best_score >= SIMILARITY_THRESHOLD:
+    if best_score >= threshold:
         return {
             'status': 'identified',
             'name': best_speaker['name'],
@@ -162,13 +213,13 @@ def identify_speaker(audio_path: str, patient_id: str) -> dict:
             'confidence': round(best_score, 4),
             'speaker_id': best_speaker['speaker_id'],
             'patient_id': patient_id,
-            'threshold_used': SIMILARITY_THRESHOLD,
+            'threshold_used': threshold,
             'alert_text': f"This is {best_speaker['name']} — Your {best_speaker['relation']}"
         }
     else:
         return {
             'status': 'unrecognised',
-            'reason': f'Best cosine similarity {best_score:.4f} < threshold {SIMILARITY_THRESHOLD}',
+            'reason': f'Best cosine similarity {best_score:.4f} < threshold {threshold}',
             'best_score': round(best_score, 4),
             'alert_text': 'Unrecognised Speaker'
         }
@@ -231,7 +282,8 @@ async def enroll_endpoint(
 @app.post('/identify')
 async def identify_endpoint(
     audio: UploadFile = File(..., description='Live audio capture (.wav, min 2.5s)'),
-    patient_id: str = Form(default='patient_001', description='Patient UUID')
+    patient_id: str = Form(default='patient_001', description='Patient UUID'),
+    threshold: float = Form(default=SIMILARITY_THRESHOLD, description='Similarity threshold for matching')
 ):
     """
     Identify a speaker from live audio.
@@ -242,7 +294,7 @@ async def identify_endpoint(
         tmp_path = tmp.name
 
     try:
-        result = identify_speaker(tmp_path, patient_id=patient_id)
+        result = identify_speaker(tmp_path, patient_id=patient_id, threshold=threshold)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
